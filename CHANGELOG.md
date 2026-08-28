@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- **Default download area centered on the boat.** When no area has been
+  configured, the plugin derives the default bbox (±3° lat / ±4° lon,
+  clamped away from the poles and the antimeridian) from
+  `navigation.position` instead of the hardcoded western Mediterranean —
+  seeded from the current position at startup, or from the first GPS fix
+  when it arrives later (automatic downloads hold off briefly until an
+  area is known, so a boat whose GPS is still acquiring does not fetch
+  the fallback area on the wrong side of the planet). With no position
+  ever available, the Mediterranean remains the last-resort default. A
+  bbox saved from the webapp is the user's choice and is never moved;
+  the derived default is never persisted. A settings file still carrying
+  exactly the old default box (persisted by earlier versions on every
+  load) is migrated back to “unset” so the boat-centered default takes
+  over.
+- The webapp shows the boat's position on the map, centers on the boat
+  when no area is saved, and gains a “Center on boat” button to
+  re-center the area on demand.
+
 ## [0.2.4] — 2026-08-28
 
 ### Changed

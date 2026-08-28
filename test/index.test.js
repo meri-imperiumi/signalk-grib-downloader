@@ -16,7 +16,9 @@ const path = require('path')
 const makePlugin = require('../dist/index.js')
 const { expectedRunStamp, fetchFingerprint } = require('../dist/scheduler.js')
 
-const BBOX = { latMin: 35, lonMin: -6, latMax: 45, lonMax: 17 }
+// A user-drawn box (deliberately different from the historical default —
+// the load-time migration drops exactly-default boxes, see test/bbox-default.test.js).
+const BBOX = { latMin: 58, lonMin: 18, latMax: 62, lonMax: 24 }
 const SOURCE = { model: 'icon-eu', autoDownload: true }
 const INTERNET_STATE_PATH = 'network.internet.state'
 

@@ -3,8 +3,9 @@ import * as os from 'os'
 import * as path from 'path'
 import { Path, Plugin, ServerAPI } from '@signalk/server-api'
 import { Orchestrator } from './orchestrator'
+import { boatCenteredBbox, FALLBACK_BBOX, isFallbackBbox } from './geo'
 import { sourceDirName } from './scheduler'
-import { AppSettings, InternetState, PluginSettings } from './types'
+import { AppSettings, Bbox, InternetState, PluginSettings } from './types'
 
 const PLUGIN_ID = 'signalk-grib-downloader'
 const DEFAULT_CHECK_INTERVAL_MINUTES = 10
@@ -20,6 +21,10 @@ const TIMER_MAX_MS = 2_147_483_000
 // captive), maintained by whichever connectivity-tracking plugin is
 // installed.
 const INTERNET_STATE_PATH = 'network.internet.state' as Path
+
+// The boat's position — source of the default download area until the
+// user draws one in the webapp.
+const POSITION_PATH = 'navigation.position' as Path
 
 // "~/gribs" is not expanded by Node — resolve it ourselves.
 function expandHome(p: string): string {
@@ -71,8 +76,11 @@ const buildSchema = (defaultRoot: string, defaultInterval: number, defaultMultip
   },
 })
 
+// No default bbox here: an absent bbox in settings.json means "derive a
+// box centered on the boat" (src/geo.ts); FALLBACK_BBOX covers the
+// no-position-ever case. Older versions spread a default Med box into
+// every load and persisted it — see dropLegacyDefaultBbox in loadSettings.
 const DEFAULT_APP_SETTINGS: AppSettings = {
-  bbox: { latMin: 35, lonMin: -6, latMax: 45, lonMax: 17 },
   sources: [],
 }
 
@@ -86,6 +94,9 @@ module.exports = (server: ServerAPI): Plugin => {
   let infra: PluginSettings = {}
   let settings: AppSettings = { ...DEFAULT_APP_SETTINGS }
   let legacyIntervalMinutes: number | undefined
+  let derivedBbox: Bbox | null = null
+  let stopPositionStream: (() => void) | null = null
+  let bboxFallbackTimer: ReturnType<typeof setTimeout> | null = null
 
   const DEFAULT_ROOT = '~/.signalk/gribs'
   const gribsRoot = () => expandHome(infra.gribsRoot || DEFAULT_ROOT)
@@ -133,20 +144,20 @@ module.exports = (server: ServerAPI): Plugin => {
     try {
       const raw = JSON.parse(fs.readFileSync(settingsPath(), 'utf-8')) as AppSettings
       legacyIntervalMinutes = validInterval(raw.checkIntervalMinutes)
-      const loaded = normalizeSettings(raw)
+      const loaded = dropLegacyDefaultBbox(normalizeSettings(raw))
       saveSettings(loaded)
       return loaded
     } catch {
       // First run — migrate any operational fields a previous version
       // stored in the plugin options, then persist them to settings.json.
       legacyIntervalMinutes = validInterval(legacy.checkIntervalMinutes)
-      const migrated = normalizeSettings({
+      const migrated = dropLegacyDefaultBbox(normalizeSettings({
         ...DEFAULT_APP_SETTINGS,
         ...(legacy.mode ? { mode: legacy.mode } : {}),
         ...(legacy.checkIntervalMinutes ? { checkIntervalMinutes: legacy.checkIntervalMinutes } : {}),
         ...(legacy.bbox ? { bbox: legacy.bbox } : {}),
         ...(legacy.sources ? { sources: legacy.sources } : {}),
-      })
+      }))
       saveSettings(migrated)
       return migrated
     }
@@ -155,6 +166,87 @@ module.exports = (server: ServerAPI): Plugin => {
   const saveSettings = (s: AppSettings) => {
     fs.mkdirSync(server.getDataDirPath(), { recursive: true })
     fs.writeFileSync(settingsPath(), JSON.stringify(s, null, 2))
+  }
+
+  // One-time migration: older versions persisted the default Med box
+  // into settings.json (their DEFAULT_APP_SETTINGS spread into every
+  // load). A box exactly equal to that default was never a deliberate
+  // user choice — drop it so the boat-centered default takes over. Any
+  // other box is the user's and is never touched. Runs only when loading
+  // settings from disk, not on PUT — so a user who deliberately saves
+  // the fallback area keeps it.
+  const dropLegacyDefaultBbox = (s: AppSettings): AppSettings => {
+    if (isFallbackBbox(s.bbox)) delete s.bbox
+    return s
+  }
+
+  // ── Boat-centered default download area ───────────────────────────
+  // Until the user draws an area in the webapp, the default bbox is
+  // derived from the boat's position and never persisted: a bbox present
+  // in settings.json always means the user chose it. Derived defaults
+  // follow only the first fix after start (they are not re-centered as
+  // the boat sails — re-center explicitly from the webapp).
+
+  const positionFix = (v: unknown): { latitude: number; longitude: number } | null => {
+    if (v === null || typeof v !== 'object') return null
+    const p = v as { latitude?: unknown; longitude?: unknown }
+    if (typeof p.latitude !== 'number' || !Number.isFinite(p.latitude)) return null
+    if (typeof p.longitude !== 'number' || !Number.isFinite(p.longitude)) return null
+    return { latitude: p.latitude, longitude: p.longitude }
+  }
+
+  // How long the scheduler waits for the first GPS fix before falling
+  // back to FALLBACK_BBOX, so a GPS-less restart does not fetch the
+  // fallback area while a fix is only seconds away. (Env-overridable for
+  // tests.)
+  const bboxTrackTimeoutMs = (): number =>
+    Number(process.env.GRIB_BBOX_TRACK_TIMEOUT_MS) || 2 * 60_000
+
+  // The area downloads actually use: the user's saved choice, else the
+  // box derived from the boat, else the historical fallback.
+  const effectiveBbox = (): Bbox | undefined =>
+    settings.bbox ?? derivedBbox ?? FALLBACK_BBOX
+
+  // True while no area is known at all: no saved bbox and no fix yet.
+  const bboxPending = (): boolean => !settings.bbox && derivedBbox === null
+
+  const stopBboxTracking = (): void => {
+    stopPositionStream?.()
+    stopPositionStream = null
+    if (bboxFallbackTimer) { clearTimeout(bboxFallbackTimer); bboxFallbackTimer = null }
+  }
+
+  const onPositionFix = (v: unknown): void => {
+    if (settings.bbox || derivedBbox) return
+    const fix = positionFix(v)
+    if (!fix) return
+    derivedBbox = boatCenteredBbox(fix.latitude, fix.longitude)
+    stopBboxTracking()
+    server.debug(`bbox: no area configured — defaulting to a box centered on the boat (${fix.latitude.toFixed(2)}, ${fix.longitude.toFixed(2)})`)
+    apply()
+  }
+
+  const onBboxFallback = (): void => {
+    bboxFallbackTimer = null
+    if (settings.bbox || derivedBbox) return
+    derivedBbox = FALLBACK_BBOX
+    server.debug('bbox: no boat position — defaulting to the Mediterranean fallback area')
+    apply()
+  }
+
+  // Seed the default from the current position if known, else follow
+  // navigation.position until the first fix arrives.
+  const startBboxTracking = (): void => {
+    if (settings.bbox) return
+    const fix = positionFix(server.getSelfPath(POSITION_PATH))
+    if (fix) {
+      derivedBbox = boatCenteredBbox(fix.latitude, fix.longitude)
+      return
+    }
+    stopPositionStream = server.streambundle
+      .getSelfStream(POSITION_PATH)
+      .onValue(onPositionFix)
+    bboxFallbackTimer = setTimeout(onBboxFallback, bboxTrackTimeoutMs())
   }
 
   const updateStatus = () => {
@@ -230,7 +322,9 @@ module.exports = (server: ServerAPI): Plugin => {
   const runTick = (): void => {
     if (timer) { clearTimeout(timer); timer = null }
     nextTickAtMs = null
-    if (!orchestrator || ticking) return
+    // While no area is known (no saved bbox, no fix yet), hold off — the
+    // bbox tracker's apply() re-kicks the scheduler once an area is set.
+    if (!orchestrator || ticking || bboxPending()) return
     ticking = true
     orchestrator.tick(internetState)
       .catch((err: unknown) => server.debug(`tick error: ${err}`))
@@ -272,12 +366,14 @@ module.exports = (server: ServerAPI): Plugin => {
       gribsRoot(),
       (msg: string) => server.debug(msg),
       updateStatus,
-      settings.bbox
+      effectiveBbox()
     )
 
-    if (sources.some(s => s.autoDownload !== false)) {
+    if (sources.some(s => s.autoDownload !== false) && !bboxPending()) {
       runTick() // immediate catch-up; reschedules when it settles
     } else {
+      // All-manual, or no area known yet: nothing to schedule — the
+      // tracker's apply() re-kicks the scheduler once an area is known.
       updateStatus()
     }
   }
@@ -295,6 +391,11 @@ module.exports = (server: ServerAPI): Plugin => {
       }
       settings = loadSettings(options ?? {})
 
+      // No user-drawn area yet? Derive the default from the boat's
+      // position — before apply(), so the first orchestrator already
+      // carries it.
+      startBboxTracking()
+
       // Follow network.internet.state if some plugin publishes it: seed
       // from the server's tree, then follow its deltas. Without a
       // publisher neither ever fires and the state stays 'unknown',
@@ -311,6 +412,8 @@ module.exports = (server: ServerAPI): Plugin => {
     stop: () => {
       stopInternetStream?.()
       stopInternetStream = null
+      stopBboxTracking()
+      derivedBbox = null
       if (timer) { clearTimeout(timer); timer = null }
       nextTickAtMs = null
       orchestrator = null
@@ -357,6 +460,10 @@ module.exports = (server: ServerAPI): Plugin => {
           return res.status(500).json({ error: String(err) })
         }
         settings = next
+        // A bbox in the saved settings is the user's choice — stop
+        // deriving a default. (A settings PUT without a bbox leaves the
+        // tracker running.)
+        if (next.bbox) { derivedBbox = null; stopBboxTracking() }
         apply()
         res.json({ ok: true })
       })

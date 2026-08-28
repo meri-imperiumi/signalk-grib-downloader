@@ -121,6 +121,9 @@
         <div><label data-i18n="west">Ouest</label><input id="bb-lonmin" type="number" step="0.5"></div>
         <div><label data-i18n="east">Est</label><input id="bb-lonmax" type="number" step="0.5"></div>
       </div>
+      <div style="margin-top:8px">
+        <button class="secondary small" id="btn-center-boat"></button>
+      </div>
     </div>
 
     <div id="save-bar">
@@ -153,6 +156,7 @@ const I18N = {
     addSource: '+ Ajouter une source', zone: 'Zone de téléchargement (GFS)',
     zoneHint: 'Glissez les coins du rectangle sur la carte — appliqué aux modèles avec découpe serveur (GFS). AROME / Arpège / ICON distribuent leur domaine entier.',
     north: 'Nord', south: 'Sud', west: 'Ouest', east: 'Est',
+    centerOnBoat: '⛵ Centrer sur le bateau', noPosition: 'Position du bateau inconnue',
     save: 'Enregistrer', saved: 'Enregistré ✓', dirty: 'Modifications non enregistrées',
     saveError: 'Erreur : ', downloadAll: 'Tout télécharger', download: '⬇',
     stUpToDate: 'à jour', stStale: 'en retard', stRunning: 'téléchargement…', stError: 'erreur',
@@ -181,6 +185,7 @@ const I18N = {
     addSource: '+ Add source', zone: 'Download area (GFS)',
     zoneHint: 'Drag the rectangle corners on the map — applies to models with server-side subsetting (GFS). AROME / Arpège / ICON distribute their whole domain.',
     north: 'North', south: 'South', west: 'West', east: 'East',
+    centerOnBoat: '⛵ Center on boat', noPosition: 'Boat position unknown',
     save: 'Save', saved: 'Saved ✓', dirty: 'Unsaved changes',
     saveError: 'Error: ', downloadAll: 'Download all', download: '⬇',
     stUpToDate: 'up to date', stStale: 'behind', stRunning: 'downloading…', stError: 'error',
@@ -230,7 +235,24 @@ function fmtVol(mb) {
 }
 
 // ── State ────────────────────────────────────────────────────────────────────
-let config = { bbox: { latMin: 35, lonMin: -6, latMax: 45, lonMax: 17 }, sources: [] }
+// Historical fallback area (western Mediterranean) — used when no bbox is
+// saved and no boat position is known. Mirrors src/geo.ts FALLBACK_BBOX.
+const FALLBACK_BBOX = { latMin: 35, lonMin: -6, latMax: 45, lonMax: 17 }
+
+// Default box centered on the boat: ±3° lat / ±4° lon, clamped like the
+// server-side helper — keep in sync with boatCenteredBbox in src/geo.ts
+// (test/webapp.test.js asserts both agree).
+function boatCenteredBbox(lat, lon) {
+  const cLat = Math.max(-82, Math.min(82, lat))
+  const cLon = ((lon + 540) % 360) - 180
+  const r6 = n => Math.round(n * 1e6) / 1e6
+  return {
+    latMin: r6(cLat - 3), latMax: r6(cLat + 3),
+    lonMin: r6(Math.max(-180, cLon - 4)), lonMax: r6(Math.min(180, cLon + 4)),
+  }
+}
+
+let config = { bbox: { ...FALLBACK_BBOX }, sources: [] }
 let statusBySource = {}
 let schedulerError = null
 let internetState = 'unknown'
@@ -277,6 +299,29 @@ const cornerIcon = L.divIcon({
   html: '<div style="width:14px;height:14px;border-radius:50%;background:#4d9fff;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.5)"></div>',
   className: '', iconSize: [14, 14], iconAnchor: [7, 7],
 })
+
+// ── Boat marker & position ──────────────────────────────────────
+let boatMarker = null
+const boatIcon = L.divIcon({
+  html: '<div style="font-size:20px;line-height:20px;filter:drop-shadow(0 1px 3px rgba(0,0,0,.7))">⛵</div>',
+  className: '', iconSize: [20, 20], iconAnchor: [10, 10],
+})
+function updateBoatMarker(pos) {
+  if (!pos) return
+  if (boatMarker) boatMarker.setLatLng([pos.lat, pos.lon])
+  else boatMarker = L.marker([pos.lat, pos.lon], { icon: boatIcon, interactive: false }).addTo(map)
+}
+
+async function boatPosition() {
+  try {
+    const r = await fetch('/signalk/v2/api/vessels/self/navigation.position', { cache: 'no-store' })
+    if (!r.ok) return null
+    const v = await r.json()
+    return Number.isFinite(v?.latitude) && Number.isFinite(v?.longitude)
+      ? { lat: v.latitude, lon: v.longitude }
+      : null
+  } catch { return null }
+}
 
 function bboxFromInputs() {
   return {
@@ -332,6 +377,19 @@ function refreshRect(fit) {
     renderSources()
     markDirty()
   })
+})
+
+// Recenter the area on the boat on demand (also the escape hatch when
+// the derived default has drifted stale).
+document.getElementById('btn-center-boat').textContent = t.centerOnBoat
+document.getElementById('btn-center-boat').addEventListener('click', async () => {
+  const pos = await boatPosition()
+  if (!pos) { alert(t.noPosition); return }
+  updateBoatMarker(pos)
+  config.bbox = boatCenteredBbox(pos.lat, pos.lon)
+  refreshRect(true)
+  renderSources()  // GFS volume estimation depends on the bbox
+  markDirty()
 })
 
 // ── Sources table ────────────────────────────────────────────────────────────
@@ -570,6 +628,7 @@ function updateStatusUI() {
 }
 
 async function pollStatus() {
+  boatPosition().then(updateBoatMarker)  // keep the boat marker fresh
   try {
     const r = await fetch(`${API}/status`, { cache: 'no-store' })
     if (!r.ok) {
@@ -604,7 +663,12 @@ async function loadConfig() {
       ...s,
       autoDownload: s.autoDownload ?? (s.enabled !== false),
     }))
-    config.bbox = c.bbox ?? { latMin: 35, lonMin: -6, latMax: 45, lonMax: 17 }
+    // No saved area: default to a box centered on the boat (mirrors the
+    // server-side default); the historical Med box is the last resort.
+    // Displayed but not dirty — nothing is saved until the user acts.
+    const pos = await boatPosition()
+    updateBoatMarker(pos)
+    config.bbox = c.bbox ?? (pos ? boatCenteredBbox(pos.lat, pos.lon) : { ...FALLBACK_BBOX })
   }
   renderSchedule()
   renderSources()
