@@ -314,7 +314,7 @@ function updateBoatMarker(pos) {
 
 async function boatPosition() {
   try {
-    const r = await fetch('/signalk/v2/api/vessels/self/navigation.position', { cache: 'no-store' })
+    const r = await fetch('/signalk/v1/api/vessels/self/navigation/position/value', { cache: 'no-store' })
     if (!r.ok) return null
     const v = await r.json()
     return Number.isFinite(v?.latitude) && Number.isFinite(v?.longitude)
